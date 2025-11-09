@@ -1,147 +1,128 @@
-import sys
 import time
+import math
+from collections import deque
+
 import numpy as np
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QPushButton, QVBoxLayout, QWidget, QHBoxLayout
-)
-from PyQt6.QtCore import QThread, pyqtSignal
-
-import matplotlib
-matplotlib.use("QtAgg")
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from matplotlib.figure import Figure
+import streamlit as st
 
 
-def ecg_beat_template(fs=250):
-    t = np.linspace(0, 1, fs, endpoint=False)
-    g = lambda c, w, a: a * np.exp(-0.5 * ((t - c) / w) ** 2)
+FS = 250                 
+WINDOW_SECONDS = 5       
+CHUNK_SECONDS = 0.10     
+NOISE = 0.05             
 
-    beat = (
-        g(0.18, 0.05, 0.12) +
-        g(0.37, 0.02, -0.15) +
-        g(0.40, 0.015, 1.0) +
-        g(0.43, 0.015, -0.25) +
-        g(0.60, 0.08, 0.35)
-    )
+def ecg_beat_template(fs=FS):
+    beat_len = int(fs * 0.8)
+    t = np.linspace(0, 1, beat_len, endpoint=False)
 
-    beat /= np.max(np.abs(beat))
+    def gauss(t, a, mu, sigma):
+        return a * np.exp(-0.5 * ((t - mu) / sigma) ** 2)
+
+    p  = gauss(t, 0.08, 0.18, 0.015)
+    q  = gauss(t, -0.15, 0.30, 0.010)
+    r  = gauss(t, 1.00, 0.33, 0.012)
+    s  = gauss(t, -0.25, 0.36, 0.010)
+    t_ = gauss(t, 0.35, 0.60, 0.040)
+
+    beat = p + q + r + s + t_
+    beat /= np.max(np.abs(beat) + 1e-8)
     return beat
 
+def bpm_to_samples(bpm, fs=FS):
+    rr_seconds = 60.0 / max(bpm, 1e-6)
+    return max(int(rr_seconds * fs), 1)
 
-def generate_streaming_ecg(fs=250, hr=70,
-                           noise_std=0.03,
-                           emg_std=0.02,
-                           powerline_amp=0.05,
-                           mains_freq=60):
-
-    beat = ecg_beat_template(fs)
-    rr = int((60 / hr) * fs)
-    t = 0
-
-    while True:
-        t_base = np.linspace(0, 1, len(beat), endpoint=False)
-        t_rr = np.linspace(0, 1, rr, endpoint=False)
-        stretched = np.interp(t_rr, t_base, beat)
-
-        for sample in stretched:
-            sample += np.random.normal(0, noise_std)
-            sample += np.random.normal(0, emg_std) * np.random.uniform(-1, 1)
-            sample += powerline_amp * np.sin(2 * np.pi * mains_freq * (t / fs))
-            t += 1
-            yield sample
-
-
-class ECGThread(QThread):
-    new_sample = pyqtSignal(float)
-
-    def __init__(self, fs=50):
-        super().__init__()
+class ECGSimulator:
+    def __init__(self, fs=FS):
         self.fs = fs
-        self.running = False
+        self.base_beat = ecg_beat_template(fs)
+        self.phase = 0.0
 
-    def run(self):
-        self.running = True
-        generator = generate_streaming_ecg(fs=self.fs)
+    def generate_chunk(self, bpm, chunk_samples):
+        rr = bpm_to_samples(bpm, self.fs)
 
-        while self.running:
-            sample = next(generator)
-            self.new_sample.emit(sample)
-            time.sleep(1 / self.fs)
+        out = np.zeros(chunk_samples, dtype=np.float32)
+        for i in range(chunk_samples):
+            idx = int(self.phase * (len(self.base_beat) - 1))
+            out[i] = self.base_beat[idx]
 
-    def stop(self):
-        self.running = False
-        self.quit()
-        self.wait()
+            self.phase += 1.0 / rr
+            if self.phase >= 1.0:
+                self.phase -= 1.0
 
+        white = np.random.normal(0.0, NOISE, size=chunk_samples)
+        t = np.arange(chunk_samples) / self.fs
+        baseline = 0.02 * np.sin(2 * math.pi * 0.3 * t)
+        muscle = np.random.normal(0.0, NOISE * 0.3, size=chunk_samples)
+        muscle = np.convolve(muscle, np.ones(3)/3.0, mode="same")
 
-class ECGCanvas(FigureCanvasQTAgg):
-    def __init__(self, fs=50, seconds=4):
-        self.fig = Figure(figsize=(6, 2.8)) 
-        super().__init__(self.fig)
+        return out + white + baseline + muscle
 
-        self.ax = self.fig.add_subplot(111)
-        self.ax.set_ylim(-2, 2)
-        self.ax.set_title("ECG em Tempo Real", fontsize=9)
-        self.ax.set_xlabel("Tempo", fontsize=8)
+st.set_page_config(page_title="ECG Tempo Real", layout="wide")
 
-        self.buffer_size = fs * seconds
-        self.buffer = np.zeros(self.buffer_size)
+st.title("ECG Sintético — Execução Fluida e com Ruído Fixo")
+st.caption("Geração automática com BPM aleatório entre 60 e 120.")
 
-        self.line, = self.ax.plot(self.buffer, linewidth=1)
+col1, col2 = st.columns([1, 3])
 
+with col1:
+    start = st.button("🚀 GERAR", use_container_width=True)
+    stop = st.button("🛑 PARAR", use_container_width=True)
 
-    def update_plot(self, new_value):
-        self.buffer = np.roll(self.buffer, -1)
-        self.buffer[-1] = new_value
+    if start:
+        st.session_state.running = True
+        st.session_state.bpm = int(np.random.randint(60, 121))
+        st.session_state.buffer = deque(maxlen=FS * WINDOW_SECONDS) 
+    
+    if stop:
+        st.session_state.running = False
 
-        self.line.set_ydata(self.buffer)
-        self.fig.canvas.draw()
+with col2:
+    chart_placeholder = st.empty()
+    info_placeholder = st.empty()
+if "running" not in st.session_state:
+    st.session_state.running = False
+if "buffer" not in st.session_state:
+    st.session_state.buffer = deque(maxlen=FS * WINDOW_SECONDS)
+if "sim" not in st.session_state:
+    st.session_state.sim = ECGSimulator(FS)
 
+if start:
+    st.session_state.running = True
+    st.session_state.bpm = int(np.random.randint(60, 121)) 
+if stop:
+    st.session_state.running = False
 
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
+def run_loop():
+    chunk_samples = int(FS * CHUNK_SECONDS)
+    next_tick = time.perf_counter()
 
-        self.setWindowTitle("ECG Real-Time com PyQt")
-        self.resize(1200, 700)
+    while st.session_state.running:
+        sig = st.session_state.sim.generate_chunk(
+            bpm=st.session_state.bpm,
+            chunk_samples=chunk_samples
+        )
 
-        main_layout = QHBoxLayout() 
+        st.session_state.buffer.extend(sig.tolist())
 
-        left_layout = QVBoxLayout()
-        self.canvas = ECGCanvas(fs=50)
-        self.thread = ECGThread(fs=50)
-        self.thread.new_sample.connect(self.canvas.update_plot)
+        y = np.array(st.session_state.buffer, dtype=np.float32)
 
-        self.button = QPushButton("Iniciar ECG")
-        self.button.clicked.connect(self.toggle_ecg)
+        chart_placeholder.line_chart({"ECG (mV)": y}, height=350)
 
-        left_layout.addWidget(self.canvas)
-        left_layout.addWidget(self.button)
+        info_placeholder.markdown(
+            f"**BPM:** {st.session_state.bpm} | **Ruído:** {NOISE} | "
+            f"**Janela:** {WINDOW_SECONDS}s | **Passo:** {CHUNK_SECONDS}s"
+        )
 
-        # onde ficará o outro sinal (filtrado)
-        right_layout = QVBoxLayout()
-        # placeholder
-        # você vai adicionar depois!
-        # ex: self.filtered_canvas = ECGCanvas(...)
-
-        main_layout.addLayout(left_layout, 1)
-        main_layout.addLayout(right_layout, 1)
-
-        container = QWidget()
-        container.setLayout(main_layout)
-        self.setCentralWidget(container)
-
-    def toggle_ecg(self):
-        if not self.thread.isRunning():
-            self.button.setText("Parar ECG")
-            self.thread.start()
+        next_tick += CHUNK_SECONDS
+        sleep_time = next_tick - time.perf_counter()
+        if sleep_time > 0:
+            time.sleep(sleep_time)
         else:
-            self.button.setText("Iniciar ECG")
-            self.thread.stop()
+            next_tick = time.perf_counter()
 
-
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    win = MainWindow()
-    win.show()
-    sys.exit(app.exec())
+if st.session_state.running:
+    run_loop()
+else:
+    y = np.array(st.session_state.buffer if len(st.session_state.buffer) > 0 else [0])
+    chart_placeholder.line_chart({"ECG (mV)": y}, height=350)
