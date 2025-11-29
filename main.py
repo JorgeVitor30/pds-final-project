@@ -154,11 +154,31 @@ col1, col2 = st.columns([1, 3])
 with col1:
     start = st.button("🚀 GERAR", use_container_width=True)
     stop = st.button("🛑 PARAR", use_container_width=True)
+    
+    window_seconds = st.number_input(
+        "Janela (s)", 
+        min_value=1.0, 
+        max_value=10.0, 
+        value=5.0, 
+        step=0.5,
+        help="Tamanho da janela de visualização em segundos"
+    )
+    
+    chunk_seconds = st.number_input(
+        "Passo (s)", 
+        min_value=0.05, 
+        max_value=1.0, 
+        value=0.10, 
+        step=0.05,
+        help="Intervalo de atualização em segundos"
+    )
 
     if start:
         st.session_state.running = True
         st.session_state.bpm = int(np.random.randint(60, 121))
-        st.session_state.buffer = deque(maxlen=FS * WINDOW_SECONDS) 
+        st.session_state.buffer = deque(maxlen=int(FS * window_seconds)) 
+        st.session_state.window_seconds = window_seconds
+        st.session_state.chunk_seconds = chunk_seconds
     
     if stop:
         st.session_state.running = False
@@ -174,6 +194,10 @@ if "sim" not in st.session_state:
     st.session_state.sim = ECGSimulator(FS)
 if "pan_tompkins" not in st.session_state:
     st.session_state.pan_tompkins = PanTompkins(FS)
+if "window_seconds" not in st.session_state:
+    st.session_state.window_seconds = WINDOW_SECONDS
+if "chunk_seconds" not in st.session_state:
+    st.session_state.chunk_seconds = CHUNK_SECONDS
 
 if start:
     st.session_state.running = True
@@ -182,7 +206,7 @@ if stop:
     st.session_state.running = False
 
 def run_loop():
-    chunk_samples = int(FS * CHUNK_SECONDS)
+    chunk_samples = int(FS * st.session_state.chunk_seconds)
     next_tick = time.perf_counter()
 
     while st.session_state.running:
@@ -216,10 +240,10 @@ def run_loop():
         info_placeholder.markdown(
             f"**BPM Gerado:** {st.session_state.bpm} | **BPM Detectado:** {detected_bpm:.1f} | "
             f"**Picos:** {len(peaks) if peaks else 0} | "
-            f"**Ruído:** {NOISE} | **Janela:** {WINDOW_SECONDS}s | **Passo:** {CHUNK_SECONDS}s"
+            f"**Ruído:** {NOISE} | **Janela:** {st.session_state.window_seconds}s | **Passo:** {st.session_state.chunk_seconds}s"
         )
 
-        next_tick += CHUNK_SECONDS
+        next_tick += st.session_state.chunk_seconds
         sleep_time = next_tick - time.perf_counter()
         if sleep_time > 0:
             time.sleep(sleep_time)
