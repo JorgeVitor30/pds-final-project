@@ -4,6 +4,7 @@ from collections import deque
 
 import numpy as np
 import streamlit as st
+from scipy import signal
 
 
 FS = 250                 
@@ -31,6 +32,91 @@ def ecg_beat_template(fs=FS):
 def bpm_to_samples(bpm, fs=FS):
     rr_seconds = 60.0 / max(bpm, 1e-6)
     return max(int(rr_seconds * fs), 1)
+
+class PanTompkins:
+    def __init__(self, fs=FS):
+        self.fs = fs
+        self.signal_filtered = None
+        self.peaks = []
+        self.rr_intervals = []
+        self.bpm = 0
+        
+        # Pan-Tompkins parameters
+        self.lowcut = 5.0
+        self.highcut = 15.0
+        self.moving_window = int(0.15 * fs) 
+        self.refractory_period = int(0.2 * fs) 
+        self.threshold_factor = 0.5
+        
+    def bandpass_filter(self, ecg_signal):
+        """Apply bandpass filter (5-15 Hz)"""
+        nyquist = 0.5 * self.fs
+        low = self.lowcut / nyquist
+        high = self.highcut / nyquist
+        b, a = signal.butter(2, [low, high], btype='band')
+        return signal.filtfilt(b, a, ecg_signal)
+    
+    def derivative(self, ecg_signal):
+        """Apply derivative filter"""
+        return np.diff(ecg_signal, prepend=ecg_signal[0])
+    
+    def squaring(self, ecg_signal):
+        """Square the signal"""
+        return ecg_signal ** 2
+    
+    def moving_window_integration(self, ecg_signal):
+        """Apply moving window integration"""
+        window = np.ones(self.moving_window) / self.moving_window
+        return np.convolve(ecg_signal, window, mode='same')
+    
+    def detect_peaks(self, integrated_signal):
+        """Detect R-peaks using adaptive thresholding"""
+        signal_max = np.max(integrated_signal)
+        threshold = self.threshold_factor * signal_max
+        
+        self.peaks = []
+        for i in range(len(integrated_signal)):
+            if integrated_signal[i] > threshold:
+                if i > 0 and i < len(integrated_signal) - 1:
+                    if integrated_signal[i] >= integrated_signal[i-1] and integrated_signal[i] >= integrated_signal[i+1]:
+                        if not self.peaks or (i - self.peaks[-1]) > self.refractory_period:
+                            self.peaks.append(i)
+                            recent_peaks = [p for p in self.peaks if (i - p) < int(2 * self.fs)]
+                            if len(recent_peaks) > 0:
+                                recent_values = [integrated_signal[p] for p in recent_peaks]
+                                threshold = self.threshold_factor * np.mean(recent_values)
+        
+        return self.peaks
+    
+    def calculate_rr_intervals(self):
+        """Calculate RR intervals and BPM"""
+        if len(self.peaks) < 2:
+            self.rr_intervals = []
+            self.bpm = 0
+            return
+        
+        self.rr_intervals = np.diff(self.peaks) / self.fs 
+        
+        if len(self.rr_intervals) > 0:
+            self.bpm = 60.0 / np.mean(self.rr_intervals)
+        else:
+            self.bpm = 0
+    
+    def process(self, ecg_signal):
+        filtered = self.bandpass_filter(ecg_signal)
+        
+        derivative = self.derivative(filtered)
+        
+        squared = self.squaring(derivative)
+        
+        integrated = self.moving_window_integration(squared)
+        
+        self.detect_peaks(integrated)
+        
+        self.calculate_rr_intervals()
+        
+        self.signal_filtered = filtered
+        return integrated
 
 class ECGSimulator:
     def __init__(self, fs=FS):
@@ -86,6 +172,8 @@ if "buffer" not in st.session_state:
     st.session_state.buffer = deque(maxlen=FS * WINDOW_SECONDS)
 if "sim" not in st.session_state:
     st.session_state.sim = ECGSimulator(FS)
+if "pan_tompkins" not in st.session_state:
+    st.session_state.pan_tompkins = PanTompkins(FS)
 
 if start:
     st.session_state.running = True
@@ -106,12 +194,29 @@ def run_loop():
         st.session_state.buffer.extend(sig.tolist())
 
         y = np.array(st.session_state.buffer, dtype=np.float32)
+        
+        if len(y) > 0:
+            integrated = st.session_state.pan_tompkins.process(y)
+            peaks = st.session_state.pan_tompkins.peaks
+            detected_bpm = st.session_state.pan_tompkins.bpm
+            
+            chart_data = {"ECG (mV)": y}
+            if peaks:
+                peak_values = [y[p] if p < len(y) else 0 for p in peaks]
+                chart_data["Picos R"] = [None] * len(y)
+                for p, val in zip(peaks, peak_values):
+                    if p < len(y):
+                        chart_data["Picos R"][p] = val
+        else:
+            detected_bpm = 0
+            chart_data = {"ECG (mV)": y}
 
-        chart_placeholder.line_chart({"ECG (mV)": y}, height=350)
+        chart_placeholder.line_chart(chart_data, height=350)
 
         info_placeholder.markdown(
-            f"**BPM:** {st.session_state.bpm} | **Ruído:** {NOISE} | "
-            f"**Janela:** {WINDOW_SECONDS}s | **Passo:** {CHUNK_SECONDS}s"
+            f"**BPM Gerado:** {st.session_state.bpm} | **BPM Detectado:** {detected_bpm:.1f} | "
+            f"**Picos:** {len(peaks) if peaks else 0} | "
+            f"**Ruído:** {NOISE} | **Janela:** {WINDOW_SECONDS}s | **Passo:** {CHUNK_SECONDS}s"
         )
 
         next_tick += CHUNK_SECONDS
@@ -125,4 +230,20 @@ if st.session_state.running:
     run_loop()
 else:
     y = np.array(st.session_state.buffer if len(st.session_state.buffer) > 0 else [0])
-    chart_placeholder.line_chart({"ECG (mV)": y}, height=350)
+    if len(y) > 1:  
+        integrated = st.session_state.pan_tompkins.process(y)
+        peaks = st.session_state.pan_tompkins.peaks
+        detected_bpm = st.session_state.pan_tompkins.bpm
+        
+        chart_data = {"ECG (mV)": y}
+        if peaks:
+            peak_values = [y[p] if p < len(y) else 0 for p in peaks]
+            chart_data["Picos R"] = [None] * len(y)
+            for p, val in zip(peaks, peak_values):
+                if p < len(y):
+                    chart_data["Picos R"][p] = val
+    else:
+        detected_bpm = 0
+        chart_data = {"ECG (mV)": y}
+    
+    chart_placeholder.line_chart(chart_data, height=350)
